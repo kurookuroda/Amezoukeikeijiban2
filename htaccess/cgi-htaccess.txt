@@ -1,0 +1,18 @@
+# CGI を置いたディレクトリに .htaccess として設置する
+
+AddDefaultCharset UTF-8
+
+# 秘密のファイルは web から読ませない
+#   global.mem  … 投稿者IPが入る
+#   ng.txt      … NGワード
+#   delpass.txt … 削除機能の合言葉ハッシュ
+#   lasttime.txt… 連投抑止のタイムスタンプ
+<FilesMatch "^(global\.mem|ng\.txt|lasttime\.txt|delpass\.txt)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>

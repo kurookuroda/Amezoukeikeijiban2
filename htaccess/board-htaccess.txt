@@ -1,0 +1,22 @@
+# 板ディレクトリ(main/ zatsu/ test/ など)に .htaccess として設置する
+
+AddDefaultCharset UTF-8
+
+# 生成されたHTMLは毎回サーバへ再検証させる。
+# ブラウザのヒューリスティックキャッシュで「投稿しても更新されない」のを防ぐ。
+<IfModule mod_headers.c>
+  <FilesMatch "\.html$">
+    Header set Cache-Control "no-cache, must-revalidate"
+  </FilesMatch>
+</IfModule>
+
+# 削除済みスレッド(x*.html)と連投抑止ファイルは見せない
+<FilesMatch "^(x\d+\.html|lasttime\.txt)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>

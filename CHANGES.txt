@@ -1,0 +1,230 @@
+========================================================================
+ Shift_JIS 版から UTF-8 版への変更点
+ 元にしたのは ame.x0.com の amezo.cgi（2007-11-11 / Wayback より回収）
+========================================================================
+
+文字コードを変換しただけでは動きません。バイト数を前提にした処理が
+何箇所かあるためです。以下が加えた変更の全てです。
+
+
+■ amezo.cgi
+
+[1] jcode.pl 依存の廃止
+
+    - require 'jcode.pl';
+    + use Encode ();
+
+    投稿の文字コード変換に jcode.pl を使っていましたが、コアモジュールの
+    Encode に置き換えました。jcode.pl 2.10 は 641/648 行で defined %hash を
+    使っており Perl 5.22 以降では文法エラーになるため、ここを外せたのは
+    副次的に大きい効果があります。
+    あわせて jcode'convert という古い package 区切り（'）も消えました。
+    この記法は Perl 5.38 で廃止されています。
+
+[2] 投稿の文字コード正規化
+
+    - &jcode'convert(*value,'sjis');
+    + $value = &to_utf8($value);
+
+    受け取ったバイト列が妥当な UTF-8 ならそのまま、そうでなければ
+    CP932(Shift_JIS) とみなして UTF-8 に変換します。古いブックマークや
+    ボットが Shift_JIS で投げてきても化けません。
+
+[3] 題名の長さ判定を「バイト数」から「文字数」へ
+
+    - (@a + 0 > 20 || length($subj) > 40) && &error("コメントが長すぎます");
+    + (@a + 0 > 20 || &clen($subj) > 20) && &error("コメントが長すぎます");
+
+    元は 40 バイト＝全角20文字のつもりでした。UTF-8 だと全角1文字が
+    3バイトなので、そのままだと13文字で弾かれてしまいます。
+
+[4] 投稿者名の切り詰めを文字単位へ
+
+    - $name = substr($name, 0, 60);
+    + $name = &ccut($name, 30);
+
+    バイト単位の substr だと多バイト文字が途中で切れて、不正なバイト列が
+    そのまま HTML に出力されます。文字単位で30文字に切るようにしました。
+
+[5] 投稿サイズの上限を 1.5 倍に
+
+    - length($buffer) > 5000 && &error('投稿内容が大きすぎます');
+    + length($buffer) > 7500 && &error('投稿内容が大きすぎます');
+
+    UTF-8 は Shift_JIS の 1.5 倍のバイト数になるため、書ける量を
+    元と同じくらいに保つための調整です。
+
+[6] 削除機能の日付パース
+
+    - if /(\d\d\d\d)..(\d\d)..(\d\d)..\(..\)(\d\d)..(\d\d)..(\d\d)/;
+    + if /(\d\d\d\d).{3}(\d\d).{3}(\d\d).{3}\(.{3}\)(\d\d).{3}(\d\d).{3}(\d\d)/;
+
+    「年」「月」「日」などの区切り文字が Shift_JIS では2バイト、
+    UTF-8 では3バイトです。ここを直さないと、レスを削除したときに
+    スレッドのタイムスタンプが復元されず、板の並び順が壊れます。
+
+[7] 生成する HTML に charset と viewport を追加
+
+    + <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    + <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    charset は必須です。viewport はスマートフォンで読めるようにするため
+    のもので、不要なら消して構いません。
+
+[8] HTTP ヘッダの charset
+
+    ソース表示(GET)・エラー画面・レス抜き出し表示(sub res)の
+    Content-type に charset=UTF-8 を付けました。
+    エラー画面には <head> と meta も足しています。
+
+[9] global.mem のパーミッションを落とす
+
+    + chmod 0600, "global.mem";
+
+    このファイルには直前にスレッドを立てた人の IP が入ります。
+    web から読める状態だと誰でも見られるため、書き出した直後に
+    600 にします（作者が 2004 年に案内していた対処と同じ内容です）。
+
+[10] スクリプト名のフォールバック
+
+    + $cgi = 'amezo.cgi' unless $cgi;
+
+    $ENV{'SCRIPT_FILENAME'} が設定されない環境で、投稿フォームの
+    action が空になるのを防ぎます。
+
+[11] 追加したサブルーチン
+
+    decode_bytes()  指定の文字コードでデコードを試す
+    to_utf8()       バイト列を UTF-8 に揃える
+    clen()          文字数を返す
+    ccut()          文字単位で切り詰める
+
+    ※ Encode::decode に CHECK を渡すと第2引数の文字列が「消費」されて
+      空になります。decode_bytes() が必ずコピーを渡しているのはそのためで、
+      ここを直接呼ぶと ASCII のフィールド（res など）が消えます。
+
+[12] 削除機能の合言葉を「別ファイル＋SHA-512 crypt」に
+
+    - crypt($name, 'am') eq 'amsqKfBaSfYYU' && &del;
+    + $delcryptfile = 'delpass.txt';   （設定変数を先頭に追加）
+    + $delcrypt = &load_delcrypt;
+    + $delcrypt ne '' && crypt($name, $delcrypt) eq $delcrypt && &del;
+    + sub load_delcrypt { ... }        （末尾に追加）
+
+    元は作者の合言葉の crypt 値(DES)がスクリプト本体に直書きされていて、
+    差し替えを忘れると作者の合言葉で削除できてしまう状態でした。
+    3つ直しています。
+
+     (a) そのハッシュを削除。
+     (b) ハッシュを本体から追い出し、別ファイル delpass.txt から読むように
+         した。amezo.cgi は GET でソースが見える公開仕様のままだが、
+         合言葉ハッシュは別ファイルにあり、それを .htaccess で web から
+         遮断しているので外からは見えない。ファイルが無い/空なら削除機能は
+         無効（初期状態）。合言葉の変更も delpass.txt を書き換えるだけで、
+         本体を触らずに済む。
+     (c) ハッシュ方式を DES から SHA-512 crypt ($6$) に。
+         DES は先頭8バイトしか見ず総当たりにも弱いため。XServer(Perl 5.16)
+         で $6$ が使えることは確認済み。合言葉の長さ制限も実質なくなった。
+
+    元のハッシュ 'amsqKfBaSfYYU' は DES crypt（先頭8バイトのみ有効・salt='am'）。
+    ありがちな英単語では復元できなかったので、おそらく Shift_JIS の日本語
+    （実質4文字ぶん）が合言葉だったと思われます。復元は不要なため値ごと削除。
+
+
+■ dai.cgi
+
+    Content-type に charset=UTF-8 を追加し、出力の先頭に
+    charset と viewport の meta を出すようにしました。それだけです。
+
+
+■ blist.txt / header.html / ng.txt / delpass.txt
+
+    blist.txt   … 3板ぶんの雛形に差し替え（原本は ame.x0.com の27板）
+    header.html … 素の雛形を新規に用意。原本は当時の＠あめぞうの
+                  ヘッダそのもので、リンク先が全て消滅しているため
+    ng.txt      … 空
+    delpass.txt … 新規。削除機能の合言葉ハッシュを入れる（初期は空）
+
+
+[13] XSS 対策の強化（あめぞう型が繰り返し狙われた弱点を多層で塞ぐ）
+
+    原本も入力時に & " < > を HTML エスケープしており素朴な <script> は
+    防げるが、抜けがあったので塞いだ。
+
+    (a) シングルクォート ' も &#39; にエスケープ。属性値コンテキストの穴を
+        完全に塞ぐ。
+        + $value =~ s/'/&#39;/g;
+    (b) 自動リンクに rel="noopener noreferrer nofollow" を追加。
+        タブナビング（リンク先からの window.opener 悪用）、リファラ漏れ、
+        SEOスパムを防ぐ。href は https?: 限定・" は &quot; のままなので
+        属性を抜けられない（javascript: はリンク化されない）。
+    (c) folder のパストラバーサル禁止。form 経由の folder は板名の文字
+        制限を受けないため、/ や .. を含む・空の folder を弾く。
+        + &error('板名が不正です') if $folder eq '' || $folder =~ m{/|\.\.};
+    (d) フォーム解析を split(/=/, $pair, 2) に。= を含む投稿が途中で
+        欠けないように（データ保全。XSSではないが同時に修正）。
+
+[14] URL自動リンクを https にも対応（原本は http のみ）
+[15] referer 正規化を汎用化（原本の ame.x0.com 固定 →
+     s{^(https?://)www\.}{$1} で www 有無を吸収）
+[16] read() に CONTENT_LENGTH 未定義ガード（|| 0）
+
+[17] CSRF 対策: Origin ヘッダ検証（referer チェックの補強）
+     他サイトのフォームからの POST を弾く。referer の直後・$folder 確定後に:
+       $origin = $ENV{'HTTP_ORIGIN'};
+       $origin =~ s{//www\.}{//};
+       $origin ne '' && index($urlbase, "$origin/") != 0 && &error('不正なリクエストです');
+     Origin を送らないブラウザではスキップし、従来どおり referer に委ねる。
+     ※ハマり: 成功した s/// は(キャプチャ有無に関わらず)$1 をリセットするため、
+       $folder = $1 は origin 置換より「前」に置くこと。順序を誤ると www 付き
+       Origin で $folder が空になり「板名が不正です」で弾かれる。
+
+
+■ 追加した .htaccess の雛形
+
+    htaccess/cgi-htaccess.txt
+        CGI を置くディレクトリ用。charset の指定と、
+        global.mem / ng.txt / delpass.txt / lasttime.txt の遮断。
+
+    htaccess/board-htaccess.txt
+        板ディレクトリ用。charset の指定、生成HTMLのキャッシュ制御、
+        削除済みスレッド(x*.html)の遮断。
+
+
+■ 変えなかったところ
+
+    ・掲示板としてのロジック（スレッド生成、レス、ヘッドライン、
+      index.html の書き出し方、200レス以降の表示、連投抑止）は
+      いっさい触っていません。
+    ・投稿本文の許可タグ方針（原本は全タグをエスケープ）は変えていません。
+      装飾タグは使えませんが、それが一番安全です。
+
+
+■ 動作確認
+
+    2026-08-30、エックスサーバー（Perl 5.16）のサブディレクトリで確認。
+
+    ・新規スレッド／レスの投稿
+    ・UTF-8 で送った場合と Shift_JIS で送った場合の両方
+    ・「＼」「～」「①②③」「髙﨑」などの文字が化けないこと
+    ・題名20文字は通り、21文字は弾かれること
+    ・投稿者名35文字が30文字ちょうどに切られ、多バイト文字が
+      途中で割れないこと
+    ・二重カキコの拒否
+    ・NGワード3種（共通・投稿者欄・本文欄）
+    ・同一IPからの新規スレッド180秒抑止
+    ・ヘッドライン(dai.cgi)
+    ・レス抜き出し表示(sub res)
+    ・global.mem が 600 になり、web からは 403 になること
+    ・生成された HTML 全体が妥当な UTF-8 であること
+    ・delpass.txt が無い/空だと削除機能が働かないこと、
+      SHA-512 ハッシュを入れれば削除できること、
+      間違った合言葉では削除できないこと
+    ・delpass.txt が web から 403 になること
+    ・XSSペイロード（<script>、<img onerror>、"'onmouseover、
+      javascript:、http://…"onmouseover="…）を投稿し、生成HTMLに
+      生の危険タグ・属性・javascript:リンクが出ないこと。' が &#39; に、
+      自動リンクに rel が付くこと
+    ・folder に / や .. を含む投稿が「板名が不正です」で弾かれること
+    ・CSRF: 攻撃サイトの Origin は「不正なリクエストです」で弾かれ、
+      正規 Origin・www 付き Origin・Origin なし はいずれも投稿できること
