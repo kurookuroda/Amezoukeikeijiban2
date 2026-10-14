@@ -11,7 +11,7 @@ AddDefaultCharset UTF-8
 </IfModule>
 
 # 削除済みスレッド(x*.html)と連投抑止ファイルは見せない
-<FilesMatch "^(x\d+\.html|lasttime\.txt)$">
+<FilesMatch "^(x\d+\.html|lasttime\.txt|regen\.lock|index2?\.html\.tmp\d+)$">
   <IfModule mod_authz_core.c>
     Require all denied
   </IfModule>

@@ -1,0 +1,12 @@
+# 運用中に生成される/設定するファイル(公開リポジトリに載せない)
+global.mem
+lasttime.txt
+regen.lock
+*.tmp[0-9]*
+delpass.txt
+ng.txt
+
+# 板ディレクトリのスレッド・退避ログ・削除済みスレ
+*/[0-9]*.html
+*/x[0-9]*.html
+*/o[0-9]*.html

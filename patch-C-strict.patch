@@ -1,0 +1,372 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..2a32609
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,12 @@
++# 運用中に生成される/設定するファイル(公開リポジトリに載せない)
++global.mem
++lasttime.txt
++regen.lock
++*.tmp[0-9]*
++delpass.txt
++ng.txt
++
++# 板ディレクトリのスレッド・退避ログ・削除済みスレ
++*/[0-9]*.html
++*/x[0-9]*.html
++*/o[0-9]*.html
+diff --git a/amezo.cgi b/amezo.cgi
+index 771d979..9f2d630 100644
+--- a/amezo.cgi
++++ b/amezo.cgi
+@@ -3,6 +3,7 @@ use strict;
+ use warnings;
+ use Encode ();
+ use Fcntl qw(:flock O_RDWR O_CREAT O_EXCL);
++use Time::Local ();
+ use FindBin qw($Bin);
+ chdir($Bin);   # 相対パスで動くので、カレントをスクリプトのあるディレクトリに固定する
+ 
+@@ -26,6 +27,17 @@ my $admin   = 'サポート';
+ # 0 にすると間隔制限なし(リロードの index 再生成も毎回行う)。
+ my $post_interval = 5;
+ 
++# 板に残すスレッド数の上限。超えた古いスレッドは o<ID>.html に改名して一覧から外す
++# (URLを直接開けば読める。返信は受け付けない)。0 なら無制限。一覧の再生成コストの上限になる。
++my $max_threads = 0;
++
++# 「次のページ」の再生成を使い回す秒数(同じページ番号が続けて要求されたとき)。0 なら使い回さない。
++my $page_cache = 10;
++
++# リバースプロキシ/トンネル(cloudflared 等)が同一ホストから接続してくる場合の接続元アドレス。
++# REMOTE_ADDR がここに載っているときだけ CF-Connecting-IP / X-Forwarded-For を信用する。
++my @trusted_proxies = ('127.0.0.1', '::1');
++
+ # スレッド削除機能の合言葉ハッシュ($6$…=SHA-512 crypt)を置くファイル。
+ # このファイルが無い/空なら削除機能は誰も使えない(初期状態)。
+ # .htaccess で web からは読めないようにしてある。
+@@ -113,7 +125,8 @@ my $reload = 0;
+ $reload = 1 if $name eq $subj && $name eq $comm;
+ $reload = 1 unless length($name) || length($subj) || length($comm);
+ my @br = ($comm =~ /<br>/g);
+-(@br + 0 > 20 || clen($subj) > 20) && error("コメントが長すぎます");
++@br + 0 > 20 && error("改行が多すぎます");
++clen($subj) > 20 && error("題名が長すぎます");
+ $name =~ s/ |　|\xE2\x80\x8D//g;
+ $name = ccut($name, 30);
+ $comm =~ s/&gt;(&gt;)+/&gt;/g;
+@@ -175,15 +188,18 @@ if($next == 21 && !$reload){
+ 	my $wd = ("日", "月", "火", "水", "木", "金", "土")[$wday];
+ 	my $date = "20${yy}年${month}月${mday}日(${wd})${hour}時${min}分${sec}秒";
+ 	$res = "$yy$month$mday$hour$min$sec" unless length($res);
+-	exit if $res =~ /\D/;
+ 
+ 	my ($w, $file);
+ 	if(length($subj)){
+ 		# 新規スレッド: ID(秒単位の日時)が使用済みなら 1 つ進めて空きを探す
+ 		for(my $try = 0; ; $try++){
+ 			$file = "./$folder/$res.html";
+-			last if sysopen($w, $file, O_RDWR|O_CREAT|O_EXCL, 0644);
+-			error('スレッドを作成できません.') if !$!{EEXIST} || $try >= 30;
++			# 削除済み(x)・退避済み(o)のIDも使わない(あとで改名したときに上書きしてしまうため)
++			if(!-e "./$folder/x$res.html" && !-e "./$folder/o$res.html"){
++				last if sysopen($w, $file, O_RDWR|O_CREAT|O_EXCL, 0644);
++				error('スレッドを作成できません.') if !$!{EEXIST};
++			}
++			error('スレッドを作成できません.') if $try >= 30;
+ 			$res++;
+ 		}
+ 	}else{
+@@ -276,14 +292,45 @@ if($next == 21 && $reload && $post_interval > 0){
+ # ---------------------------------------------------------------------------
+ # index(2).html の再生成
+ # ---------------------------------------------------------------------------
+-open(my $w, '+<', $index_file) || redirect();
+-flock($w, LOCK_EX|LOCK_NB) || redirect();
++# 同じページ番号の「次のページ」要求が続くときは、直近に作ったページを使い回す
++if($next != 21 && $page_cache > 0 && open(my $pf, '<', $index_file)){
++	my $head = '';
++	read($pf, $head, 4096);
++	close($pf);
++	if($head =~ /<!-- AMEZO-NEXT (\d+) -->/ && $1 == $next){
++		my $mt = (stat($index_file))[9] || 0;
++		redirect() if time() - $mt < $page_cache;
++	}
++}
++
++# 再生成は排他ロックの下で、一時ファイルに書いてから rename で差し替える
++# (閲覧者に書きかけのページを見せない/途中で死んでも index が壊れない)。
++open(my $lk, '>>', "./$folder/regen.lock") || error('ロックファイルを作成できません.');
++my $locked;
++if($next == 21 && !$reload){
++	# 投稿直後: この投稿を載せるため、他の再生成が終わるまで(最大10秒)待つ
++	$locked = eval {
++		local $SIG{ALRM} = sub { die "timeout\n" };
++		alarm 10;
++		my $r = flock($lk, LOCK_EX);
++		alarm 0;
++		$r;
++	};
++	alarm 0;
++}else{
++	# リロード/ページ送り: 誰かが再生成中ならそちらに任せて戻る
++	$locked = flock($lk, LOCK_EX | LOCK_NB);
++}
++redirect() unless $locked;
++my $tmpfile = "$index_file.tmp$$";
++open(my $w, '>', $tmpfile) || error('indexを書き込めません.');
+ 
+ print $w <<EOF;
+ <html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+ <title>${title0}${amezo}${main}</title></head>
+ $copyright
++<!-- AMEZO-NEXT $next -->
+ <body$bg bgcolor="$color"$text>
+ <font size=+2>${title}${amezo}${main}</font>
+ EOF
+@@ -314,6 +361,22 @@ for(my $i = 0; $i < @dir; $i++){
+ }
+ @dir = sort { $b cmp $a } @dir;
+ 
++# 板に残すスレッド数を超えた古いスレッドを一覧から外す(o<ID>.html に改名)
++if($max_threads > 0){
++	my $n_thr = 0;
++	@dir = grep {
++		my $keep = 1;
++		if($_ !~ /^ ,/ && ++$n_thr > $max_threads){
++			my ($t_ts, $t_file) = split(/,/, $_, 2);
++			# 同名の退避ファイルがあれば上書きしない(その場合は一覧に残す)
++			if(!-e "./$folder/o$t_file" && rename("./$folder/$t_file", "./$folder/o$t_file")){
++				$keep = 0;
++			}
++		}
++		$keep;
++	} @dir;
++}
++
+ # ヘッドライン(題名の一覧)
+ for(my $i = $next - 21; $i < $next + 100 - 21 && $i < @dir; $i++){
+ 	my ($ts, $file) = split(/,/, $dir[$i]);
+@@ -387,9 +450,12 @@ print $w <<EOF;
+ <hr></body></html>
+ EOF
+ 
+-truncate($w, tell($w));
+-flock($w, LOCK_UN);
+-close($w);
++close($w) || do { unlink($tmpfile); error('indexを書き込めません.'); };
++my $mode = ((stat($index_file))[2] || 0644) & 07777;
++chmod($mode, $tmpfile);
++rename($tmpfile, $index_file) || do { unlink($tmpfile); error('indexを更新できません.'); };
++flock($lk, LOCK_UN);
++close($lk);
+ redirect();
+ 
+ # ---------------------------------------------------------------------------
+@@ -449,80 +515,97 @@ sub del {
+ 		$mail = '' unless $mail =~ /\@/;
+ 		return;
+ 	}
+-	print "Content-type: text/html\n\n";
+-	exit unless length($res);
++	unless(length($res)){
++		print "Content-type: text/html; charset=UTF-8\n\n";
++		exit;
++	}
+ 	my $file = "./$folder/$res.html";
+ 	if(!length($comm)){
+ 		my $newfile = "./$folder/x$res.html";
+-		rename($file, $newfile);
++		rename($file, $newfile) || error('スレッドがありません.');
+ 		chmod 0600, $newfile;
++		print "Content-type: text/html; charset=UTF-8\n\n";
+ 		exit;
+ 	}
+ 	my $dels = ',' . $comm . ',';
+-	$dels =~ s/(\d+)\-(\d+)/join(',',($1..$2))/eg;
++	# 範囲指定(a-b)を展開する。桁数と幅に上限を設け、巨大な指定でメモリを使い切らせない
++	$dels =~ s/(\d{1,9})\-(\d{1,9})/expand_range($1, $2)/eg;
+ 	$dels =~ s/<br>/,/g;
+-	my $ts = (stat($file))[9];
+-	my @lines;
+-	if(open(my $r, '<', $file)){
+-		@lines = <$r>;
+-		close($r);
+-	}
+-	my ($year, $mon, $mday, $hour, $min, $sec);
+-	open(my $w, '+>', $file) || exit;
++	# 読み込みから書き戻しまでをひとつのロックの下で行う(並行する投稿と競合しない)
++	open(my $w, '+<', $file) || error('スレッドがありません.');
+ 	flock($w, LOCK_EX);
++	my $orig_mtime = (stat($w))[9];
++	my @lines = <$w>;
++	my (@keep, @stamp);
+ 	foreach my $l (@lines){
+ 		if($l =~ /<dt>(\d+)/){
+ 			my $n = ",$1,";
+ 			next if index($dels, $n) >= 0;
+ 		}
+-		($year,$mon,$mday,$hour,$min,$sec) = ($1,$2,$3,$4,$5,$6)
++		@stamp = ($1,$2,$3,$4,$5,$6)
+ 			if $l =~ /(\d\d\d\d).{3}(\d\d).{3}(\d\d).{3}\(.{3}\)(\d\d).{3}(\d\d).{3}(\d\d)/;
+-		print $w $l;
++		push(@keep, $l);
+ 	}
++	seek($w, 0, 0);
++	truncate($w, 0);
++	print $w @keep;
+ 	close($w);
+-	# 残ったレスの最後の日時から更新時刻を手計算で復元する(日付が拾えなければ元のまま)
+-	if(defined $year){
+-		$year -= 1900;
+-		$mon--;
+-		my $uru = int(($year - 72) / 4);
+-		if(((($year + 1900) % 4) == 0) && ($mon < 2)){ $uru--; }
+-		$ts = $year - 70;
+-		$ts = $ts * 365 + (0,31,59,90,120,151,181,212,243,273,304,334)[$mon] + $mday + $uru;
+-		$ts = $ts * 24 + $hour - 9;
+-		$ts = $ts * 60 + $min;
+-		$ts = $ts * 60 + $sec;
+-		$ts -= $1*24*60*60 if $dels =~ /p(\d+)/;
++	# 更新時刻は「残った最後のレスの日時」に戻す(削除でスレッドが浮上しないように)
++	my $ts = $orig_mtime;
++	if(@stamp){
++		my $t = eval { Time::Local::timelocal($stamp[5], $stamp[4], $stamp[3], $stamp[2], $stamp[1] - 1, $stamp[0]) };
++		$ts = $t if defined $t;
+ 	}
++	$ts -= $1 * 24 * 60 * 60 if $dels =~ /p(\d+)/;
+ 	utime $ts+1, $ts+1, $file;
+ 	chmod 0404, $file if $dels =~ /x/;
++	print "Content-type: text/html; charset=UTF-8\n\n";
+ 	exit;
+ }
+ 
++# a-b を a,a+1,...,b に展開する(最大 1001 件)。
++sub expand_range {
++	my ($lo, $hi) = @_;
++	$hi = $lo + 1000 if $hi - $lo > 1000;
++	return $lo <= $hi ? join(',', $lo .. $hi) : '';
++}
++
+ sub check {
+-	my $ip = $ENV{'REMOTE_ADDR'} // '';
++	my $ip = client_ip();
+ 	my $time = time();
++	sysopen(my $z, 'global.mem', O_RDWR|O_CREAT, 0600) || return;   # 開けなくても投稿は止めない
++	flock($z, LOCK_EX);
+ 	my %iplist;
+-	if(open(my $z, '<', 'global.mem')){
+-		while(my $l = <$z>){
+-			chomp $l;
+-			my ($ip_o, $time_o) = split(' ', $l);
+-			next unless defined $ip_o && defined $time_o && $time_o =~ /^\d+$/;
+-			$iplist{$ip_o} = $time_o if $time - $time_o < 180;
+-		}
+-		close($z);
++	while(my $l = <$z>){
++		$l =~ s/\r?\n\z//;
++		my ($ip_o, $time_o) = split(' ', $l);
++		next unless defined $ip_o && defined $time_o && $time_o =~ /^\d+$/;
++		$iplist{$ip_o} = $time_o if $time - $time_o < 180;
+ 	}
+ 	if($iplist{$ip}){
+ 		my $remain = 180 - ($time - $iplist{$ip});
++		close($z);
+ 		error("あと " . $remain . "秒たってから投稿してください");
+ 	}
+ 	$iplist{$ip} = $time;
+-	if(open(my $z, '>', 'global.mem')){
+-		for my $k (keys %iplist){
+-			print $z "$k $iplist{$k}\n";
+-		}
+-		close($z);
++	seek($z, 0, 0);
++	truncate($z, 0);
++	for my $k (keys %iplist){
++		print $z "$k $iplist{$k}\n";
+ 	}
+-	chmod 0600, "global.mem";
++	close($z);
++}
++
++# 接続元IPを返す。信頼するプロキシ経由のときだけ転送ヘッダを見る(直接アクセスでの偽装を防ぐ)。
++sub client_ip {
++	my $addr = $ENV{'REMOTE_ADDR'} // '';
++	return $addr unless grep { $_ eq $addr } @trusted_proxies;
++	my $c = $ENV{'HTTP_CF_CONNECTING_IP'};
++	if(!defined $c || $c !~ /^[0-9A-Fa-f:.]{2,45}$/){
++		my @f = split(/\s*,\s*/, $ENV{'HTTP_X_FORWARDED_FOR'} // '');
++		$c = $f[-1];   # プロキシが付け足した一番右が、プロキシから見た接続元
++	}
++	return (defined $c && $c =~ /^[0-9A-Fa-f:.]{2,45}$/) ? $c : $addr;
+ }
+ 
+ # ---------------------------------------------------------------------------
+@@ -551,21 +634,32 @@ sub to_utf8 {
+ 	return $out;
+ }
+ 
+-# 文字数を返す(バイト数ではなく)。
++# 文字を1文字ずつの配列(参照)にする。HTMLエスケープ済みの &amp; &quot; &lt; &gt; &#39; は
++# 1文字として数える。UTF-8 として読めなければ undef。
++sub html_chars {
++	my ($str) = @_;
++	my $dec = decode_bytes('UTF-8', $str);
++	return undef unless defined $dec;
++	my @c = ($dec =~ /(&(?:amp|quot|lt|gt|#39);|[\s\S])/g);
++	return \@c;
++}
++
++# 文字数を返す(バイト数ではなく、エスケープ前の文字数で数える)。
+ sub clen {
+ 	my ($str) = @_;
+ 	return 0 unless defined $str;
+-	my $dec = decode_bytes('UTF-8', $str);
+-	return defined $dec ? length($dec) : length($str);
++	my $c = html_chars($str);
++	return defined $c ? scalar(@$c) : length($str);
+ }
+ 
+-# 先頭から指定文字数で切り詰める。多バイト文字を途中で割らない。
++# 先頭から指定文字数で切り詰める。多バイト文字や &amp; などの途中では割らない。
+ sub ccut {
+ 	my ($str, $max) = @_;
+ 	return '' unless defined $str;
+-	my $dec = decode_bytes('UTF-8', $str);
+-	return substr($str, 0, $max) unless defined $dec;
+-	return Encode::encode('UTF-8', substr($dec, 0, $max));
++	my $c = html_chars($str);
++	return substr($str, 0, $max) unless defined $c;
++	splice(@$c, $max) if @$c > $max;
++	return Encode::encode('UTF-8', join('', @$c));
+ }
+ 
+ # 削除機能の合言葉ハッシュを別ファイルから読む。
+diff --git a/dai.cgi b/dai.cgi
+index b4efa9f..fb4fde7 100644
+--- a/dai.cgi
++++ b/dai.cgi
+@@ -39,7 +39,7 @@ if(open(my $bl, '<', './blist.txt')){
+ 		$title =~ s/#c#/,/g;               # #c# はカンマの代わり
+ 		print <<EOF;
+ <table border=0 cellspacing=1 cellpadding=2 width=100% bgcolor="$color"><tr><td>
+-<a href="$folder/" target="naka"><b><font size="3" color="F92500">$title</a></font></b> 
++<a href="$folder/" target="naka"><b><font size="3" color="#F92500">$title</font></b></a> 
+ EOF
+ 		if(open(my $r, '<', "./$folder/index.html")){
+ 			while(my $l = <$r>){
+diff --git a/htaccess/board-htaccess.txt b/htaccess/board-htaccess.txt
+index df1f0e0..bd29424 100644
+--- a/htaccess/board-htaccess.txt
++++ b/htaccess/board-htaccess.txt
+@@ -11,7 +11,7 @@ AddDefaultCharset UTF-8
+ </IfModule>
+ 
+ # 削除済みスレッド(x*.html)と連投抑止ファイルは見せない
+-<FilesMatch "^(x\d+\.html|lasttime\.txt)$">
++<FilesMatch "^(x\d+\.html|lasttime\.txt|regen\.lock|index2?\.html\.tmp\d+)$">
+   <IfModule mod_authz_core.c>
+     Require all denied
+   </IfModule>

@@ -39,7 +39,7 @@ if(open(my $bl, '<', './blist.txt')){
 		$title =~ s/#c#/,/g;               # #c# はカンマの代わり
 		print <<EOF;
 <table border=0 cellspacing=1 cellpadding=2 width=100% bgcolor="$color"><tr><td>
-<a href="$folder/" target="naka"><b><font size="3" color="F92500">$title</a></font></b> 
+<a href="$folder/" target="naka"><b><font size="3" color="#F92500">$title</font></b></a> 
 EOF
 		if(open(my $r, '<', "./$folder/index.html")){
 			while(my $l = <$r>){
